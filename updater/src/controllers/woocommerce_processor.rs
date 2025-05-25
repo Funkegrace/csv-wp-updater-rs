@@ -18,14 +18,11 @@ use crate::worker::{NewFileProcessQueue};
 
 use tokio::sync::Semaphore;
 
-
-use std::time::Duration;
 use csv::StringRecord;
 use tokio::time::sleep;
-use futures::Future;
-use std::pin::Pin;
 
 
+use std::time::Duration;
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct ProcessingProgress {
   total_rows: usize,
@@ -90,166 +87,176 @@ impl WooCommerceProcessor {
       consumer_secret,
     }
   }
-
-async fn retry_with_backoff<F, T, E>(mut operation: F, max_retries: usize) -> Result<T, E>
-where
-    F: FnMut() -> Pin<Box<dyn Future<Output = Result<T, E>>>>,
-{
-    let mut attempt = 0;
-    let mut delay = Duration::from_millis(500);
-    while attempt < max_retries {
-        match operation().await {
-            Ok(res) => return Ok(res),
-            Err(_) if attempt < max_retries - 1 => {
-                sleep(delay).await;
-                delay *= 2;
-            }
-            Err(e) => return Err(e),
-        }
-        attempt += 1;
-    }
-    Err("Retry attempts exhausted".into())
-}
-
-pub async fn process_csv(
-    self,
-    file_path: &str,
-    field_mapping: &WordPressFieldMapping,
-    setting: &NewFileProcessQueue
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let start_row: u32 = setting.start_row;
-    let no_of_rows: u32 = setting.row_count;
-    let new_product = setting.is_new_upload;
-    let file_id = file_path.split('.').next().unwrap_or("").to_string();
-    FileProcessingManager::start_file_process(&file_id, 10000).await.unwrap_or(());
-
-    // Read records and headers
-    let mut rdr = Reader::from_path(get_upload_path(file_path))?;
-    let total_row_count: u32 = rdr.records().count().try_into().unwrap();
-
-    let mut progress = self.progress.lock().await;
-    *progress = ProcessingProgress::default();
-    let rows_to_process = if no_of_rows == 0 {
-        total_row_count - start_row
-    } else {
-        no_of_rows.min(total_row_count - start_row)
-    };
-    let rows_to_process = rows_to_process.min(40_000);
-    progress.total_rows = rows_to_process as usize;
-    drop(progress);
-
-    let mut rdr = Reader::from_path(get_upload_path(file_path))?;
-    let headers = rdr.headers()?.clone();
-
-    let reverse_mapping: HashMap<String, String> = field_mapping
-        .get_reverse_mapping()
-        .iter()
-        .map(|(k, v)| (clean_string(k), v.clone()))
-        .collect();
-
-    let reverse_attribute_mapping: HashMap<String, AttributeMapping> = field_mapping
-        .get_inverted_attribute()
-        .iter()
-        .map(|(k, v)| (clean_string(k), v.clone()))
-        .collect();
-
-    let record_vec: Vec<Result<StringRecord, csv::Error>> = rdr.records().collect();
-    let record_vec = record_vec
-        .into_iter()
-        .skip(start_row as usize)
-        .take(rows_to_process as usize)
-        .collect::<Vec<_>>();
-
-    let grouped_products = Self::group_products_by_parent(record_vec, &headers, &reverse_mapping, &reverse_attribute_mapping)?;
-    println!("Number of parent products: {}", grouped_products.len());
-
-    let semaphore = Arc::new(Semaphore::new(20)); // Limit concurrency
-    let redis_client = self.redis_client.clone();
-    let progress_arc = Arc::clone(&self.progress);
-    let new_self = Arc::new(self);
-    let api_delay = Duration::from_millis(300);
-
-    for (parent, children) in grouped_products {
-        let semaphore_clone = Arc::clone(&semaphore);
-        let new_self_clone = Arc::clone(&new_self);
-        let redis_client_clone = redis_client.clone();
-        let progress_clone = Arc::clone(&progress_arc);
-        let file_id_clone = file_id.clone();
-        let new_product_clone = new_product.clone();
-        let api_delay = api_delay.clone();
-
-        // Acquire semaphore for parent
-        let _permit = semaphore_clone.acquire().await.unwrap();
-        sleep(api_delay).await;
-
-        let parent_result = retry_with_backoff(|| {
-            let parent = parent.clone();
-            let mut redis_client = redis_client_clone.clone();
-            let new_self = Arc::clone(&new_self_clone);
-            Box::pin(async move {
-                let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
-                new_self.handle_main_product(&parent, &mut redis_conn, &new_product_clone).await
-            })
-        }, 3).await;
-
-        match parent_result {
-            Ok(updated_parent) => {
-                let parent_id = Arc::new(updated_parent.id.clone());
-
-                for child in children {
-                    let semaphore_child = Arc::clone(&semaphore_clone);
-                    let new_self_child = Arc::clone(&new_self_clone);
-                    let redis_client_child = redis_client.clone();
-                    let progress_child = Arc::clone(&progress_arc);
-                    let file_id_child = file_id.clone();
-                    let api_delay = api_delay.clone();
-                    let parent_id = Arc::clone(&parent_id);
-                    let new_product = new_product.clone();
-
-                    let _permit = semaphore_child.acquire().await.unwrap();
-                    sleep(api_delay).await;
-
-                    let result = retry_with_backoff(|| async {
-                        let child = child.clone();
-                        let mut redis_client = redis_client_child.clone();
-                        let new_self = Arc::clone(&new_self_child);
-                        let parent_id = Arc::clone(&parent_id);
-                        Box::pin(async move {
-                            let mut redis_conn = redis_client.get_multiplexed_async_connection().await?;
-                            new_self.handle_variation_product(&child, &parent_id, &mut redis_conn, &new_product).await
-                        })
-                    }, 3).await;
-
-                    let mut progress = progress_child.lock().await;
-                    FileProcessingManager::increment_progress(&file_id_child, rows_to_process).await.unwrap_or(());
-                    match result {
-                        Ok(_) => progress.successful_rows += 1,
-                        Err(_) => progress.failed_rows += 1,
-                    }
-                    progress.processed_rows += 1;
-                }
-
-                let mut progress = progress_clone.lock().await;
-                FileProcessingManager::increment_progress(&file_id_clone, rows_to_process).await.unwrap_or(());
-                progress.successful_rows += 1;
-                progress.processed_rows += 1;
-            }
-            Err(e) => {
-                println!("Error processing parent {}: {:?}", parent.sku, e);
-                let mut progress = progress_clone.lock().await;
-                progress.failed_rows += 1;
-                progress.processed_rows += 1;
-                FileProcessingManager::increment_progress(&file_id_clone, rows_to_process).await.unwrap_or(());
-            }
-        }
-    }
-
-    FileProcessingManager::mark_progress(&file_id, 100, 100).await.unwrap_or(());
-    FileProcessingManager::mark_as_done(&file_id).await.unwrap_or(());
-    Ok(())
-}
-
-
+  
+  pub async fn process_csv(
+      self,
+      file_path: &str,
+      field_mapping: &WordPressFieldMapping,
+      setting: &NewFileProcessQueue
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+      let start_row: u32 = setting.start_row;
+      let no_of_rows: u32 = setting.row_count;
+      let new_product = setting.is_new_upload;
+      let file_id = file_path.split('.').next().unwrap_or("").to_string();
+      FileProcessingManager::start_file_process(&file_id, 10000).await.unwrap_or(());
+  
+      let mut rdr = Reader::from_path(get_upload_path(file_path))?;
+      let total_row_count: u32 = rdr.records().count().try_into().unwrap();
+  
+      let mut progress = self.progress.lock().await;
+      *progress = ProcessingProgress::default();
+      let rows_to_process = if no_of_rows == 0 {
+          total_row_count - start_row
+      } else {
+          no_of_rows.min(total_row_count - start_row)
+      };
+      let rows_to_process = rows_to_process.min(40_000);
+      progress.total_rows = rows_to_process as usize;
+      drop(progress);
+  
+      let mut rdr = Reader::from_path(get_upload_path(file_path))?;
+      let headers = rdr.headers()?.clone();
+  
+      let reverse_mapping: HashMap<String, String> = field_mapping
+          .get_reverse_mapping()
+          .iter()
+          .map(|(k, v)| (clean_string(k), v.clone()))
+          .collect();
+  
+      let reverse_attribute_mapping: HashMap<String, AttributeMapping> = field_mapping
+          .get_inverted_attribute()
+          .iter()
+          .map(|(k, v)| (clean_string(k), v.clone()))
+          .collect();
+  
+      let record_vec: Vec<Result<StringRecord, csv::Error>> = rdr.records().collect();
+      let record_vec = record_vec
+          .into_iter()
+          .skip(start_row as usize)
+          .take(rows_to_process as usize)
+          .collect::<Vec<_>>();
+  
+      let grouped_products = Self::group_products_by_parent(record_vec, &headers, &reverse_mapping, &reverse_attribute_mapping)?;
+      println!("Number of parent products: {}", grouped_products.len());
+  
+      let semaphore = Arc::new(Semaphore::new(10)); // Lower concurrency for safety
+      let redis_client = self.redis_client.clone();
+      let progress_arc = Arc::clone(&self.progress);
+      let new_self = Arc::new(self);
+      let api_delay = Duration::from_millis(500); // Increase delay to reduce overload risk
+  
+      for (parent, children) in grouped_products {
+          let semaphore_clone = Arc::clone(&semaphore);
+          let new_self_clone = Arc::clone(&new_self);
+          let redis_client_clone = redis_client.clone();
+          let progress_clone = Arc::clone(&progress_arc);
+          let file_id_clone = file_id.clone();
+          let new_product_clone = new_product.clone();
+          let api_delay = api_delay.clone();
+  
+          let _permit = semaphore_clone.acquire().await.unwrap();
+          sleep(api_delay).await;
+  
+          let parent_result = {
+              let parent = parent.clone();
+              let mut redis_client = redis_client_clone.clone();
+              let new_self = Arc::clone(&new_self_clone);
+              let mut attempt = 0;
+              let max_retries = 3;
+              loop {
+                  match redis_client.get_multiplexed_async_connection().await {
+                      Ok(mut conn) => {
+                          match new_self.handle_main_product(&parent, &mut conn, &new_product_clone).await {
+                              Ok(p) => break Ok(p),
+                              Err(e) if attempt < max_retries => {
+                                  attempt += 1;
+                                  sleep(Duration::from_millis(1000 * attempt as u64)).await;
+                              }
+                              Err(e) => break Err(e),
+                          }
+                      }
+                      Err(e) if attempt < max_retries => {
+                          attempt += 1;
+                          sleep(Duration::from_millis(1000 * attempt as u64)).await;
+                      }
+                      Err(e) => break Err(e.into()),
+                  }
+              }
+          };
+  
+          match parent_result {
+              Ok(updated_parent) => {
+                  let parent_id = Arc::new(updated_parent.id.clone());
+  
+                  for child in children {
+                      let semaphore_child = Arc::clone(&semaphore_clone);
+                      let new_self_child = Arc::clone(&new_self_clone);
+                      let redis_client_child = redis_client.clone();
+                      let progress_child = Arc::clone(&progress_arc);
+                      let file_id_child = file_id.clone();
+                      let api_delay = api_delay.clone();
+                      let parent_id = Arc::clone(&parent_id);
+                      let new_product = new_product.clone();
+  
+                      let _permit = semaphore_child.acquire().await.unwrap();
+                      sleep(api_delay).await;
+  
+                      let result = {
+                          let child = child.clone();
+                          let mut redis_client = redis_client_child.clone();
+                          let new_self = Arc::clone(&new_self_child);
+                          let mut attempt = 0;
+                          let max_retries = 3;
+                          loop {
+                              match redis_client.get_multiplexed_async_connection().await {
+                                  Ok(mut conn) => {
+                                      match new_self.handle_variation_product(&child, &parent_id, &mut conn, &new_product).await {
+                                          Ok(r) => break Ok(r),
+                                          Err(e) if attempt < max_retries => {
+                                              attempt += 1;
+                                              sleep(Duration::from_millis(1000 * attempt as u64)).await;
+                                          }
+                                          Err(e) => break Err(e),
+                                      }
+                                  }
+                                  Err(e) if attempt < max_retries => {
+                                      attempt += 1;
+                                      sleep(Duration::from_millis(1000 * attempt as u64)).await;
+                                  }
+                                  Err(e) => break Err(e.into()),
+                              }
+                          }
+                      };
+  
+                      let mut progress = progress_child.lock().await;
+                      FileProcessingManager::increment_progress(&file_id_child, rows_to_process).await.unwrap_or(());
+                      match result {
+                          Ok(_) => progress.successful_rows += 1,
+                          Err(_) => progress.failed_rows += 1,
+                      }
+                      progress.processed_rows += 1;
+                  }
+  
+                  let mut progress = progress_clone.lock().await;
+                  FileProcessingManager::increment_progress(&file_id_clone, rows_to_process).await.unwrap_or(());
+                  progress.successful_rows += 1;
+                  progress.processed_rows += 1;
+              }
+              Err(e) => {
+                  println!("Error processing parent {}: {:?}", parent.sku, e);
+                  let mut progress = progress_clone.lock().await;
+                  progress.failed_rows += 1;
+                  progress.processed_rows += 1;
+                  FileProcessingManager::increment_progress(&file_id_clone, rows_to_process).await.unwrap_or(());
+              }
+          }
+      }
+  
+      FileProcessingManager::mark_progress(&file_id, 100, 100).await.unwrap_or(());
+      FileProcessingManager::mark_as_done(&file_id).await.unwrap_or(());
+      Ok(())
+  }
+    
 async fn process_csv_old(self, file_path: &str, field_mapping: &WordPressFieldMapping, setting: &NewFileProcessQueue) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // File id is file path without ext
     let start_row: u32  = setting.start_row;
