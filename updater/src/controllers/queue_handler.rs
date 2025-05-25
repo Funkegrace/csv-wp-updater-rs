@@ -51,7 +51,7 @@ impl RabbitMQFileProcessor {
                     if message.is_ok() {
                         let message = message.unwrap();
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
-                        task::spawn(async move {
+                        // task::spawn(async move {
                             if let Err(processing_error) =
                                 process_woocommerce_csv(message.clone()).await
                             {
@@ -60,7 +60,7 @@ impl RabbitMQFileProcessor {
                                 println!("File processed successfully: {}", message.file);
                             }
                             drop(permit);
-                        });
+                        // });
                     }
                     file_extract_queue_consumer.ack(delivery)?;
                 }
